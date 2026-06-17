@@ -18,7 +18,71 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import re
+
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    estimate_price_fairness,
+    get_trending_styles,
+)
+from memory import apply_profile, update_profile
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract search parameters from a natural-language query using lightweight
+    regex — no LLM needed for this step (documented in planning.md).
+
+    Pulls out:
+      - max_price: from patterns like "under $30", "below 40", "$25"
+      - size:      from "size M", "in size 8", or a standalone size token
+      - description: the query with the price/size phrases stripped out
+
+    Returns a dict: {"description": str, "size": str | None, "max_price": float | None}
+    """
+    text = query.strip()
+    lowered = text.lower()
+
+    # max_price: "under $30", "below 40", "less than $25", or a bare "$30"
+    max_price = None
+    price_match = re.search(
+        r"(?:under|below|less than|max|up to|cheaper than)\s*\$?\s*(\d+(?:\.\d+)?)",
+        lowered,
+    )
+    if not price_match:
+        price_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", lowered)
+    if price_match:
+        max_price = float(price_match.group(1))
+
+    # size: "size M", "in size 8", "in a medium"
+    size = None
+    size_match = re.search(
+        r"\bsize\s+([a-z0-9]+)\b", lowered
+    ) or re.search(
+        r"\bin\s+(?:a\s+)?(xs|s|m|l|xl|xxl|small|medium|large)\b", lowered
+    )
+    if size_match:
+        size = size_match.group(1).upper()
+
+    # description: strip the price and size phrases so they don't pollute keywords
+    description = re.sub(
+        r"(?:under|below|less than|max|up to|cheaper than)\s*\$?\s*\d+(?:\.\d+)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(r"\$\s*\d+(?:\.\d+)?", "", description)
+    description = re.sub(
+        r"\bsize\s+[a-z0-9]+\b", "", description, flags=re.IGNORECASE
+    )
+    description = re.sub(r"\s+", " ", description).strip()
+    description = description.strip(" ,.;")  # drop stray punctuation left behind
+
+    return {"description": description or text, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -42,15 +106,70 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+        # ── stretch-feature state ──
+        "adjustments": [],           # retry: what constraints were loosened
+        "price_assessment": None,    # dict from estimate_price_fairness
+        "trends": None,              # list of trending tags used for styling
+        "memory_notes": [],          # what the style profile contributed
+        "profile": None,             # updated style profile (caller may persist)
     }
+
+
+# ── search with retry/fallback (stretch) ────────────────────────────────────────
+
+def _search_with_retry(parsed: dict) -> tuple[list[dict], list[str]]:
+    """
+    Run search_listings; if it returns nothing, progressively loosen the
+    constraints and retry. Returns (results, adjustments) where `adjustments`
+    lists, in plain language, what was relaxed to get a result.
+
+    Order of loosening: size filter first (most likely to over-restrict), then
+    the price ceiling. Keywords are never dropped — that would change intent.
+    """
+    adjustments: list[str] = []
+
+    results = search_listings(
+        description=parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+    if results:
+        return results, adjustments
+
+    # Retry 1: drop the size filter.
+    if parsed.get("size"):
+        results = search_listings(
+            description=parsed["description"], size=None, max_price=parsed["max_price"]
+        )
+        if results:
+            adjustments.append(f"removed the size {parsed['size']} filter")
+            return results, adjustments
+
+    # Retry 2: also drop the price ceiling.
+    if parsed.get("max_price") is not None:
+        results = search_listings(
+            description=parsed["description"], size=None, max_price=None
+        )
+        if results:
+            if parsed.get("size"):
+                adjustments.append(f"removed the size {parsed['size']} filter")
+            adjustments.append(f"ignored the ${parsed['max_price']:g} budget")
+            return results, adjustments
+
+    return [], adjustments
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
 
-def run_agent(query: str, wardrobe: dict) -> dict:
+def run_agent(query: str, wardrobe: dict, profile: dict | None = None) -> dict:
     """
     Main agent entry point. Runs the FitFindr planning loop for a single
     user interaction and returns the completed session dict.
+
+    `profile` (optional, stretch: style memory) is a remembered style profile.
+    When given, the agent fills gaps the query left blank (size/budget/style)
+    from it, and returns an updated profile in session["profile"] for the caller
+    to persist.
 
     Args:
         query:    Natural language user request
@@ -92,9 +211,74 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session — the single source of truth for this interaction.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Guard: empty query.
+    if not query or not query.strip():
+        session["error"] = (
+            "Tell me what you're looking for — e.g. 'vintage graphic tee under "
+            "$30, size M'."
+        )
+        return session
+
+    # Step 2: parse the query into search parameters.
+    session["parsed"] = _parse_query(query)
+
+    # Step 2b (stretch: style memory): fill blanks from the remembered profile.
+    if profile is not None:
+        session["parsed"], session["memory_notes"] = apply_profile(
+            session["parsed"], profile
+        )
+    parsed = session["parsed"]
+
+    # Step 3: search, with retry/fallback (stretch). Branch on the result.
+    session["search_results"], session["adjustments"] = _search_with_retry(parsed)
+
+    if not session["search_results"]:
+        # ERROR BRANCH: stop here. Do NOT call suggest_outfit with empty input.
+        bits = []
+        if parsed["max_price"] is not None:
+            bits.append(f"raising your ${parsed['max_price']:g} budget")
+        if parsed["size"]:
+            bits.append(f"dropping the size {parsed['size']} filter")
+        bits.append("using broader keywords")
+        session["error"] = (
+            f"No listings matched \"{parsed['description']}\" even after "
+            "loosening filters. Try "
+            + ", or ".join(bits)
+            + "."
+        )
+        return session
+
+    # Step 4: select the top-ranked result and put it in state.
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 4b (stretch: price comparison): is it a fair price?
+    session["price_assessment"] = estimate_price_fairness(session["selected_item"])
+
+    # Step 4c (stretch: trend awareness): what's popular for this size?
+    trend_info = get_trending_styles(parsed.get("size"))
+    session["trends"] = trend_info["trending_tags"]
+
+    # Step 5: suggest an outfit (trend-aware). The tool handles the empty-wardrobe
+    # case itself and always returns a non-empty string.
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], session["wardrobe"], trends=session["trends"]
+    )
+
+    # Step 6: turn the outfit into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 6b (stretch: style memory): learn from this run for next time.
+    if profile is not None:
+        session["profile"] = update_profile(
+            profile, parsed, session["selected_item"]
+        )
+
+    # Step 7: done.
     return session
 
 
@@ -115,9 +299,42 @@ if __name__ == "__main__":
         print(f"\nOutfit: {session['outfit_suggestion']}")
         print(f"\nFit card: {session['fit_card']}")
 
+        # stretch: price comparison + trend awareness
+        pa = session["price_assessment"]
+        print(f"\nPrice check: [{pa['verdict']}] {pa['reasoning']}")
+        print(f"Trending used: {session['trends']}")
+
     print("\n\n=== No-results path ===\n")
     session2 = run_agent(
         query="designer ballgown size XXS under $5",
         wardrobe=get_example_wardrobe(),
     )
     print(f"Error message: {session2['error']}")
+
+    print("\n\n=== Stretch: retry with fallback ===\n")
+    # A real item, but with an impossible size that forces a loosen-and-retry.
+    session3 = run_agent(
+        query="Levi's jeans size ZZ9 under $60",
+        wardrobe=get_example_wardrobe(),
+    )
+    if session3["error"]:
+        print(f"Error: {session3['error']}")
+    else:
+        print(f"Found after retry: {session3['selected_item']['title']}")
+        print(f"Adjustments made: {session3['adjustments']}")
+
+    print("\n\n=== Stretch: style profile memory (two sessions) ===\n")
+    from memory import _empty_profile
+
+    profile = _empty_profile()
+    print("Session A — explicit: 'vintage graphic tee size M under $30'")
+    sA = run_agent("vintage graphic tee size M under $30", get_example_wardrobe(), profile)
+    profile = sA["profile"]
+    print(f"  parsed: {sA['parsed']}")
+    print(f"  profile now: size={profile['size']}, "
+          f"top tags={sorted(profile['style_tags'], key=profile['style_tags'].get, reverse=True)[:3]}")
+
+    print("\nSession B — NO size given: 'show me a flannel'")
+    sB = run_agent("show me a flannel", get_example_wardrobe(), profile)
+    print(f"  parsed (size filled from memory): {sB['parsed']}")
+    print(f"  memory contributed: {sB['memory_notes']}")
